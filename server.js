@@ -30,12 +30,14 @@ pool.connect((err, client, release) => {
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
-    origin: process.env.FRONTEND_ORIGIN || 'https://airtimesolutionfrontend.onrender.com',
+    origin: 'https://airtimesolutionfrontend.onrender.com',
     credentials: true
 }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
+
+app.set('trust proxy', 1);
 
 app.use(session({
     store: new pgSession({
@@ -46,10 +48,10 @@ app.use(session({
     resave: false,
     saveUninitialized: false,
     cookie: {
-        secure: process.env.NODE_ENV === 'production',
+        secure: true,
         httpOnly: true,
         maxAge: 24 * 60 * 60 * 1000,
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
+        sameSite: 'none'
     }
 }));
 
