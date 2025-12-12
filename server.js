@@ -968,20 +968,16 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-app.get('/login', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'login.html'));
-});
-
-app.get('/admin', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'admin.html'));
+    res.json({ 
+        message: 'Airtime Solution Kenya API', 
+        status: 'running',
+        frontend: process.env.FRONTEND_ORIGIN || 'https://airtimesolutionfrontend.onrender.com'
+    });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://airtimesolutiontest.onrender.com'}`);
+    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://airtimesolutionfrontend.onrender.com'}`);
     console.log(`Callback URL: ${CALLBACK_BASE_URL}`);
 });
 
