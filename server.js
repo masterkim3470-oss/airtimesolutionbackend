@@ -235,15 +235,28 @@ app.post('/api/payments/deposit', async (req, res) => {
     try {
         const { phone, amount, email } = req.body;
         
+        console.log('=== DEPOSIT REQUEST STARTED ===');
+        console.log('Request body:', { phone, amount, email });
+        console.log('Environment check:');
+        console.log('- PAYNECTA_API_KEY exists:', !!PAYNECTA_API_KEY);
+        console.log('- PAYNECTA_API_KEY length:', PAYNECTA_API_KEY ? PAYNECTA_API_KEY.length : 0);
+        console.log('- PAYNECTA_EMAIL exists:', !!PAYNECTA_EMAIL);
+        console.log('- PAYNECTA_EMAIL value:', PAYNECTA_EMAIL);
+        console.log('- CALLBACK_BASE_URL:', CALLBACK_BASE_URL);
+        
         if (!phone || !amount || !email) {
+            console.log('Validation failed: missing fields');
             return res.status(400).json({ success: false, message: 'Phone, amount, and email are required' });
         }
         
         if (parseFloat(amount) < 10) {
+            console.log('Validation failed: amount too low');
             return res.status(400).json({ success: false, message: 'Minimum deposit is KES 10' });
         }
         
         const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+        console.log('User lookup result:', userResult.rows.length > 0 ? 'Found' : 'Not found');
+        
         if (userResult.rows.length === 0) {
             return res.status(404).json({ success: false, message: 'User not found' });
         }
@@ -252,25 +265,43 @@ app.post('/api/payments/deposit', async (req, res) => {
         const formattedPhone = phone.startsWith('254') ? phone : `254${phone.replace(/^0/, '')}`;
         const reference = `DEP-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
+        console.log('Formatted phone:', formattedPhone);
+        console.log('Reference:', reference);
+        
         const transactionId = uuidv4();
         await pool.query(
             `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, created_at)
              VALUES ($1, $2, 'deposit', $3, 0, $4, 'pending', 'paynecta', $5, $6, NOW())`,
             [transactionId, userId, amount, calculateBonus(parseFloat(amount)), formattedPhone, reference]
         );
+        console.log('Transaction created:', transactionId);
         
-        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payments/initiate', {
+        const paynectaPayload = {
             phone: formattedPhone,
             amount: parseFloat(amount),
             reference: reference,
             callback_url: `${CALLBACK_BASE_URL}/api/payments/paynecta/callback`
-        }, {
+        };
+        
+        console.log('=== CALLING PAYNECTA API ===');
+        console.log('Paynecta URL: https://paynecta.co.ke/api/v1/payments/initiate');
+        console.log('Paynecta payload:', JSON.stringify(paynectaPayload));
+        console.log('Headers being sent:', {
+            'X-API-Key': PAYNECTA_API_KEY ? `${PAYNECTA_API_KEY.substring(0, 5)}...` : 'NOT SET',
+            'X-User-Email': PAYNECTA_EMAIL || 'NOT SET'
+        });
+        
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payments/initiate', paynectaPayload, {
             headers: {
                 'X-API-Key': PAYNECTA_API_KEY,
                 'X-User-Email': PAYNECTA_EMAIL,
                 'Content-Type': 'application/json'
             }
         });
+        
+        console.log('=== PAYNECTA RESPONSE ===');
+        console.log('Status:', paynectaResponse.status);
+        console.log('Response data:', JSON.stringify(paynectaResponse.data));
         
         if (paynectaResponse.data.success) {
             res.json({
@@ -282,10 +313,22 @@ app.post('/api/payments/deposit', async (req, res) => {
             });
         } else {
             await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transactionId]);
+            console.log('Paynecta returned failure:', paynectaResponse.data.message);
             res.status(400).json({ success: false, message: paynectaResponse.data.message || 'Payment initiation failed' });
         }
     } catch (error) {
-        console.error('Deposit error:', error.response?.data || error);
+        console.log('=== DEPOSIT ERROR ===');
+        console.log('Error name:', error.name);
+        console.log('Error message:', error.message);
+        console.log('Error code:', error.code);
+        if (error.response) {
+            console.log('API Error Status:', error.response.status);
+            console.log('API Error Status Text:', error.response.statusText);
+            console.log('API Error Data:', JSON.stringify(error.response.data));
+        } else if (error.request) {
+            console.log('Request was made but no response received');
+        }
+        console.log('Full error stack:', error.stack);
         res.status(500).json({ success: false, message: 'Payment service error. Please try again.' });
     }
 });
