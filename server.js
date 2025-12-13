@@ -12,7 +12,7 @@ const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 
 const app = express();
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 3000;
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -347,58 +347,70 @@ if (paynectaResponse.data && paynectaResponse.data.success) {
 
 app.post('/api/payments/paynecta/callback', async (req, res) => {
     try {
-        console.log('=== PAYNECTA CALLBACK RECEIVED ===');
-        console.log('Callback body:', JSON.stringify(req.body));
+        console.log('=== PAYNECTA WEBHOOK RECEIVED ===');
+        console.log('Webhook body:', JSON.stringify(req.body));
         
-        const { reference, status, mpesa_code, amount, transaction_reference } = req.body;
+        res.status(200).json({ success: true, message: 'Webhook received' });
         
-        // Get the reference from either field Paynecta might send
-        const callbackReference = reference || transaction_reference;
+        const { event_type, event_id, data } = req.body;
         
-        if (!callbackReference) {
-            console.log('No reference in callback');
-            return res.status(400).json({ success: false, message: 'Reference required' });
+        if (!event_type || !data) {
+            const { reference, status, mpesa_code, transaction_reference } = req.body;
+            const callbackReference = reference || transaction_reference;
+            
+            if (callbackReference) {
+                console.log('Legacy callback format detected');
+                await processPaymentUpdate(callbackReference, status, mpesa_code);
+            }
+            return;
         }
         
-        console.log('Looking up transaction with reference:', callbackReference);
+        console.log('Event type:', event_type);
+        console.log('Event ID:', event_id);
         
-        // FIX: Search by either the DEP- reference OR the paynecta reference in metadata
+        const transactionData = data.transaction || {};
+        const paynectaReference = transactionData.reference;
+        const mpesaReceipt = data.MpesaReceiptNumber || null;
+        
+        if (!paynectaReference) {
+            console.log('No transaction reference in webhook');
+            return;
+        }
+        
+        console.log('PayNecta reference:', paynectaReference);
+        
         let transactionResult = await pool.query(
-            'SELECT id, user_id, amount, bonus, status FROM transactions WHERE reference = $1',
-            [callbackReference]
+            `SELECT id, user_id, amount, bonus, status FROM transactions 
+             WHERE metadata->>'paynecta_reference' = $1`,
+            [paynectaReference]
         );
         
-        // If not found by reference, search in metadata for paynecta_reference
         if (transactionResult.rows.length === 0) {
-            console.log('Not found by reference, searching in metadata...');
             transactionResult = await pool.query(
-                `SELECT id, user_id, amount, bonus, status FROM transactions 
-                 WHERE metadata->>'paynecta_reference' = $1`,
-                [callbackReference]
+                'SELECT id, user_id, amount, bonus, status FROM transactions WHERE reference = $1',
+                [paynectaReference]
             );
         }
         
         if (transactionResult.rows.length === 0) {
-            console.warn('Transaction not found for reference:', callbackReference);
-            return res.status(404).json({ success: false, message: 'Transaction not found' });
+            console.warn('Transaction not found for PayNecta reference:', paynectaReference);
+            return;
         }
         
         const transaction = transactionResult.rows[0];
         console.log('Found transaction:', transaction.id, 'Current status:', transaction.status);
         
         if (transaction.status !== 'pending') {
-            console.log('Transaction already processed:', callbackReference, transaction.status);
-            return res.json({ success: true, message: 'Transaction already processed' });
+            console.log('Transaction already processed:', paynectaReference, transaction.status);
+            return;
         }
         
-        // Normalize status check to handle different formats
-        const normalizedStatus = (status || '').toLowerCase();
-        if (normalizedStatus === 'success' || normalizedStatus === 'completed' || normalizedStatus === 'successful') {
-            console.log('Payment successful, updating transaction and balance...');
+        if (event_type === 'payment.completed') {
+            console.log('Payment completed, updating transaction and balance...');
             
             await pool.query(
                 `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
-                [JSON.stringify({ mpesa_code, paynecta_reference: callbackReference }), transaction.id]
+                [JSON.stringify({ mpesa_code: mpesaReceipt, paynecta_reference: paynectaReference }), transaction.id]
             );
             
             const totalAmount = parseFloat(transaction.amount);
@@ -409,7 +421,6 @@ app.post('/api/payments/paynecta/callback', async (req, res) => {
                 [totalAmount, bonus, transaction.user_id]
             );
             
-            // Add notification for successful deposit
             await pool.query(
                 `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
                  VALUES ($1, $2, 'user', 'Deposit Successful! 💰', $3, false, NOW())`,
@@ -429,23 +440,68 @@ app.post('/api/payments/paynecta/callback', async (req, res) => {
             }
             
             console.log(`Deposit successful for user ${transaction.user_id}: KES ${totalAmount} + ${bonus} bonus`);
-        } else {
-            console.log('Payment failed/cancelled, status:', status);
-            await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transaction.id]);
+            
+        } else if (event_type === 'payment.failed' || event_type === 'payment.cancelled') {
+            const reason = data.reason || 'Payment was not completed';
+            console.log('Payment failed/cancelled:', reason);
+            
+            await pool.query(
+                `UPDATE transactions SET status = 'failed', metadata = $1 WHERE id = $2`,
+                [JSON.stringify({ failure_reason: reason, paynecta_reference: paynectaReference }), transaction.id]
+            );
         }
         
-        res.json({ success: true, message: 'Callback processed' });
     } catch (error) {
-        console.error('Callback error:', error);
-        res.status(500).json({ success: false, message: 'Callback processing error' });
+        console.error('Webhook processing error:', error);
     }
 });
+
+async function processPaymentUpdate(reference, status, mpesaCode) {
+    try {
+        let transactionResult = await pool.query(
+            `SELECT id, user_id, amount, bonus, status FROM transactions 
+             WHERE metadata->>'paynecta_reference' = $1 OR reference = $1`,
+            [reference]
+        );
+        
+        if (transactionResult.rows.length === 0) return;
+        
+        const transaction = transactionResult.rows[0];
+        if (transaction.status !== 'pending') return;
+        
+        const normalizedStatus = (status || '').toLowerCase();
+        if (normalizedStatus === 'success' || normalizedStatus === 'completed' || normalizedStatus === 'successful') {
+            await pool.query(
+                `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
+                [JSON.stringify({ mpesa_code: mpesaCode, paynecta_reference: reference }), transaction.id]
+            );
+            
+            const totalAmount = parseFloat(transaction.amount);
+            const bonus = parseFloat(transaction.bonus);
+            
+            await pool.query(
+                'UPDATE users SET balance = balance + $1, bonus_balance = bonus_balance + $2 WHERE id = $3',
+                [totalAmount, bonus, transaction.user_id]
+            );
+            
+            await pool.query(
+                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                 VALUES ($1, $2, 'user', 'Deposit Successful! 💰', $3, false, NOW())`,
+                [uuidv4(), transaction.user_id, `KES ${totalAmount} has been added to your account${bonus > 0 ? ` plus KES ${bonus} bonus!` : '.'}`]
+            );
+        } else {
+            await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transaction.id]);
+        }
+    } catch (error) {
+        console.error('Process payment update error:', error);
+    }
+}
 
 app.get('/api/payments/status/:reference', async (req, res) => {
     try {
         const { reference } = req.params;
         const result = await pool.query(
-            'SELECT status, amount, bonus, created_at FROM transactions WHERE reference = $1',
+            'SELECT id, user_id, status, amount, bonus, metadata, created_at FROM transactions WHERE reference = $1',
             [reference]
         );
         
@@ -453,7 +509,112 @@ app.get('/api/payments/status/:reference', async (req, res) => {
             return res.status(404).json({ success: false, message: 'Transaction not found' });
         }
         
-        res.json({ success: true, transaction: result.rows[0] });
+        const transaction = result.rows[0];
+        
+        if (transaction.status === 'pending') {
+            let paynectaReference = null;
+            try {
+                const metadata = typeof transaction.metadata === 'string' 
+                    ? JSON.parse(transaction.metadata) 
+                    : transaction.metadata;
+                paynectaReference = metadata?.paynecta_reference;
+            } catch (e) {
+                console.log('Error parsing metadata:', e);
+            }
+            
+            if (paynectaReference && PAYNECTA_API_KEY && PAYNECTA_EMAIL) {
+                try {
+                    console.log('Polling PayNecta status for:', paynectaReference);
+                    
+                    const statusResponse = await axios.get(
+                        `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(paynectaReference)}`,
+                        {
+                            headers: {
+                                'X-API-Key': PAYNECTA_API_KEY,
+                                'X-User-Email': PAYNECTA_EMAIL
+                            },
+                            timeout: 10000
+                        }
+                    );
+                    
+                    console.log('PayNecta status response:', JSON.stringify(statusResponse.data));
+                    
+                    if (statusResponse.data && statusResponse.data.success && statusResponse.data.data) {
+                        const paymentData = statusResponse.data.data;
+                        const paynectaStatus = (paymentData.status || '').toLowerCase();
+                        
+                        if (paynectaStatus === 'completed') {
+                            const mpesaReceipt = paymentData.mpesa_receipt_number || paymentData.MpesaReceiptNumber || null;
+                            
+                            await pool.query(
+                                `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
+                                [JSON.stringify({ mpesa_code: mpesaReceipt, paynecta_reference: paynectaReference }), transaction.id]
+                            );
+                            
+                            const totalAmount = parseFloat(transaction.amount);
+                            const bonus = parseFloat(transaction.bonus);
+                            
+                            await pool.query(
+                                'UPDATE users SET balance = balance + $1, bonus_balance = bonus_balance + $2 WHERE id = $3',
+                                [totalAmount, bonus, transaction.user_id]
+                            );
+                            
+                            await pool.query(
+                                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                                 VALUES ($1, $2, 'user', 'Deposit Successful! 💰', $3, false, NOW())`,
+                                [uuidv4(), transaction.user_id, `KES ${totalAmount} has been added to your account${bonus > 0 ? ` plus KES ${bonus} bonus!` : '.'}`]
+                            );
+                            
+                            console.log(`Status poll: Deposit completed for user ${transaction.user_id}: KES ${totalAmount}`);
+                            
+                            return res.json({ 
+                                success: true, 
+                                transaction: { 
+                                    status: 'completed', 
+                                    amount: transaction.amount, 
+                                    bonus: transaction.bonus, 
+                                    created_at: transaction.created_at,
+                                    mpesa_receipt: mpesaReceipt
+                                } 
+                            });
+                            
+                        } else if (paynectaStatus === 'failed' || paynectaStatus === 'cancelled') {
+                            const failureReason = paymentData.failure_reason || paymentData.result_description || 'Payment was not completed';
+                            
+                            await pool.query(
+                                `UPDATE transactions SET status = 'failed', metadata = $1 WHERE id = $2`,
+                                [JSON.stringify({ failure_reason: failureReason, paynecta_reference: paynectaReference }), transaction.id]
+                            );
+                            
+                            console.log(`Status poll: Payment failed for transaction ${transaction.id}: ${failureReason}`);
+                            
+                            return res.json({ 
+                                success: true, 
+                                transaction: { 
+                                    status: 'failed', 
+                                    amount: transaction.amount, 
+                                    bonus: transaction.bonus, 
+                                    created_at: transaction.created_at,
+                                    failure_reason: failureReason
+                                } 
+                            });
+                        }
+                    }
+                } catch (pollError) {
+                    console.error('PayNecta status poll error:', pollError.message);
+                }
+            }
+        }
+        
+        res.json({ 
+            success: true, 
+            transaction: { 
+                status: transaction.status, 
+                amount: transaction.amount, 
+                bonus: transaction.bonus, 
+                created_at: transaction.created_at 
+            } 
+        });
     } catch (error) {
         console.error('Status query error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
