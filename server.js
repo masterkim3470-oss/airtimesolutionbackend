@@ -79,7 +79,7 @@ const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
 const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_609202';
 const STATUM_CONSUMER_KEY = process.env.STATUM_CONSUMER_KEY;
 const STATUM_CONSUMER_SECRET = process.env.STATUM_CONSUMER_SECRET;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '3462Abel@#';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 
 const CALLBACK_BASE_URL = process.env.CALLBACK_BASE_URL || 'https://airtimesolutionbackend2.onrender.com';
 const PAYHERO_LINK = 'https://short.payhero.co.ke/s/oEvAxA8Xx6cDoBLxntShmF';
 
@@ -92,6 +92,33 @@ function calculateBonus(amount) {
 
 function calculateAirtimeCost(amount) {
     return Math.floor(amount * 0.9);
+}
+
+async function getStatumBalance() {
+    try {
+        const statumAuth = Buffer.from(`${STATUM_CONSUMER_KEY}:${STATUM_CONSUMER_SECRET}`).toString('base64');
+        
+        const response = await axios.get('https://api.statum.co.ke/api/v2/account-balance', {
+            headers: {
+                'Authorization': `Basic ${statumAuth}`,
+                'Content-Type': 'application/json'
+            },
+            timeout: 10000
+        });
+        
+        if (response.data && response.data.status_code === 200) {
+            return {
+                success: true,
+                balance: parseFloat(response.data.available_balance) || 0,
+                request_id: response.data.request_id
+            };
+        }
+        
+        return { success: false, balance: 0, error: response.data?.description || 'Failed to get balance' };
+    } catch (error) {
+        console.error('Statum balance check error:', error.message);
+        return { success: false, balance: 0, error: error.message };
+    }
 }
 
 app.get('/api/users/check-email/:email', async (req, res) => {
@@ -776,12 +803,45 @@ app.post('/api/payments/payhero/callback', async (req, res) => {
 
 app.get('/api/airtime/float-status', async (req, res) => {
     try {
-        const result = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
-        const isLow = result.rows.length > 0 && result.rows[0].value === 'true';
-        res.json({ success: true, floatLow: isLow });
+        const statumBalance = await getStatumBalance();
+        
+        if (statumBalance.success) {
+            const isLow = statumBalance.balance < 10;
+            res.json({ 
+                success: true, 
+                floatLow: isLow,
+                availableFloat: statumBalance.balance
+            });
+        } else {
+            const result = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
+            const isLow = result.rows.length > 0 && result.rows[0].value === 'true';
+            res.json({ success: true, floatLow: isLow, availableFloat: 0 });
+        }
     } catch (error) {
         console.error('Float status error:', error);
-        res.json({ success: true, floatLow: false });
+        res.json({ success: true, floatLow: false, availableFloat: 0 });
+    }
+});
+
+app.get('/api/statum/balance', async (req, res) => {
+    try {
+        const statumBalance = await getStatumBalance();
+        
+        if (statumBalance.success) {
+            res.json({ 
+                success: true, 
+                availableBalance: statumBalance.balance,
+                request_id: statumBalance.request_id
+            });
+        } else {
+            res.status(500).json({ 
+                success: false, 
+                message: statumBalance.error || 'Failed to get Statum balance'
+            });
+        }
+    } catch (error) {
+        console.error('Statum balance endpoint error:', error);
+        res.status(500).json({ success: false, message: 'Failed to get balance' });
     }
 });
 
@@ -793,13 +853,34 @@ app.post('/api/airtime/buy', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Phone, amount, and email are required' });
         }
         
-        if (parseFloat(amount) < 5) {
+        const airtimeAmount = parseFloat(amount);
+        
+        if (airtimeAmount < 5) {
             return res.status(400).json({ success: false, message: 'Minimum airtime is KES 5' });
         }
         
-        const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
-        if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
-            return res.status(503).json({ success: false, message: 'Airtime service temporarily unavailable. Please try again later.' });
+        const actualAirtime = calculateAirtimeCost(airtimeAmount);
+        
+        const statumBalance = await getStatumBalance();
+        console.log('Statum balance check:', statumBalance);
+        
+        if (!statumBalance.success) {
+            return res.status(503).json({ 
+                success: false, 
+                message: 'Unable to verify airtime service. Please try again later.',
+                floatCheckFailed: true
+            });
+        }
+        
+        if (statumBalance.balance < actualAirtime) {
+            const maxPurchasable = Math.floor(statumBalance.balance / 0.9);
+            return res.status(400).json({
+                success: false,
+                message: `Airtime float is low. Maximum available is KES ${statumBalance.balance}. You can purchase up to KES ${maxPurchasable} worth.`,
+                floatLow: true,
+                availableFloat: statumBalance.balance,
+                maxPurchasable: maxPurchasable > 0 ? maxPurchasable : 0
+            });
         }
         
         const userResult = await pool.query(
@@ -813,72 +894,109 @@ app.post('/api/airtime/buy', async (req, res) => {
         
         const user = userResult.rows[0];
         const totalBalance = parseFloat(user.balance) + parseFloat(user.bonus_balance);
-        const airtimeAmount = parseFloat(amount);
         
         if (totalBalance < airtimeAmount) {
             return res.status(400).json({
                 success: false,
                 message: 'Insufficient balance',
+                insufficientBalance: true,
                 balance: totalBalance,
                 required: airtimeAmount,
-                shortfall: airtimeAmount - totalBalance
+                shortfall: airtimeAmount - totalBalance,
+                availableFloat: statumBalance.balance
             });
         }
         
         const formattedPhone = phone.startsWith('254') ? phone : `254${phone.replace(/^0/, '')}`;
         const reference = `AIR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
         
-        const actualAirtime = calculateAirtimeCost(airtimeAmount);
+        const userBonusBalance = parseFloat(user.bonus_balance);
+        const userMainBalance = parseFloat(user.balance);
         
-        let remainingAmount = airtimeAmount;
-        let bonusUsed = 0;
-        let balanceUsed = 0;
+        let bonusUsed = Math.min(userBonusBalance, airtimeAmount);
+        let balanceUsed = Math.min(userMainBalance, airtimeAmount - bonusUsed);
         
-        if (parseFloat(user.bonus_balance) > 0) {
-            bonusUsed = Math.min(parseFloat(user.bonus_balance), remainingAmount);
-            remainingAmount -= bonusUsed;
+        if (bonusUsed + balanceUsed < airtimeAmount) {
+            return res.status(400).json({
+                success: false,
+                message: 'Insufficient balance',
+                insufficientBalance: true,
+                balance: totalBalance,
+                required: airtimeAmount,
+                shortfall: airtimeAmount - totalBalance
+            });
         }
-        balanceUsed = remainingAmount;
         
         const transactionId = uuidv4();
-        await pool.query(
-            `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
-             VALUES ($1, $2, 'airtime', $3, $4, 0, 'pending', 'statum', $5, $6, $7, NOW())`,
-            [transactionId, user.id, airtimeAmount, airtimeAmount - actualAirtime, formattedPhone, reference, JSON.stringify({ actual_airtime: actualAirtime })]
-        );
         
-        const statumAuth = Buffer.from(`${STATUM_CONSUMER_KEY}:${STATUM_CONSUMER_SECRET}`).toString('base64');
-        
-        const statumResponse = await axios.post('https://api.statum.co.ke/api/v2/airtime', {
-            phone_number: formattedPhone,
-            amount: actualAirtime.toString()
-        }, {
-            headers: {
-                'Authorization': `Basic ${statumAuth}`,
-                'Content-Type': 'application/json'
-            }
-        });
-        
-        if (statumResponse.data.status_code === 200) {
-            await pool.query(
-                'UPDATE users SET balance = balance - $1, bonus_balance = bonus_balance - $2 WHERE id = $3',
-                [balanceUsed, bonusUsed, user.id]
-            );
+        try {
+            const statumAuth = Buffer.from(`${STATUM_CONSUMER_KEY}:${STATUM_CONSUMER_SECRET}`).toString('base64');
             
-            await pool.query(
-                `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
-                [JSON.stringify({ actual_airtime: actualAirtime, statum_request_id: statumResponse.data.request_id }), transactionId]
-            );
-            
-            res.json({
-                success: true,
-                message: `Airtime sent! KES ${actualAirtime} to ${formattedPhone}`,
-                airtimeSent: actualAirtime,
-                reference: reference
+            const statumResponse = await axios.post('https://api.statum.co.ke/api/v2/airtime', {
+                phone_number: formattedPhone,
+                amount: actualAirtime.toString()
+            }, {
+                headers: {
+                    'Authorization': `Basic ${statumAuth}`,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 30000
             });
-        } else {
-            await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transactionId]);
-            res.status(400).json({ success: false, message: 'Airtime purchase failed. Please try again.' });
+            
+            console.log('Statum airtime response:', statumResponse.data);
+            
+            if (statumResponse.data.status_code === 200) {
+                await pool.query(
+                    'UPDATE users SET balance = balance - $1, bonus_balance = bonus_balance - $2 WHERE id = $3',
+                    [balanceUsed, bonusUsed, user.id]
+                );
+                
+                await pool.query(
+                    `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
+                     VALUES ($1, $2, 'airtime', $3, $4, 0, 'completed', 'statum', $5, $6, $7, NOW())`,
+                    [transactionId, user.id, airtimeAmount, airtimeAmount - actualAirtime, formattedPhone, reference, 
+                     JSON.stringify({ actual_airtime: actualAirtime, statum_request_id: statumResponse.data.request_id, bonus_used: bonusUsed, balance_used: balanceUsed })]
+                );
+                
+                await pool.query(
+                    `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                     VALUES ($1, $2, 'user', 'Airtime Sent! 📱', $3, false, NOW())`,
+                    [uuidv4(), user.id, `KES ${actualAirtime} airtime has been sent to ${formattedPhone}`]
+                );
+                
+                res.json({
+                    success: true,
+                    message: `Airtime sent! KES ${actualAirtime} to ${formattedPhone}`,
+                    airtimeSent: actualAirtime,
+                    reference: reference
+                });
+            } else {
+                console.error('Statum airtime failed:', statumResponse.data);
+                
+                await pool.query(
+                    `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
+                     VALUES ($1, $2, 'airtime', $3, $4, 0, 'failed', 'statum', $5, $6, $7, NOW())`,
+                    [transactionId, user.id, airtimeAmount, airtimeAmount - actualAirtime, formattedPhone, reference, 
+                     JSON.stringify({ actual_airtime: actualAirtime, error: statumResponse.data.description || 'Statum API error' })]
+                );
+                
+                res.status(400).json({ 
+                    success: false, 
+                    message: statumResponse.data.description || 'Airtime purchase failed. Please try again.',
+                    statumError: true
+                });
+            }
+        } catch (statumError) {
+            console.error('Statum API call error:', statumError.response?.data || statumError.message);
+            
+            await pool.query(
+                `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
+                 VALUES ($1, $2, 'airtime', $3, $4, 0, 'failed', 'statum', $5, $6, $7, NOW())`,
+                [transactionId, user.id, airtimeAmount, airtimeAmount - actualAirtime, formattedPhone, reference, 
+                 JSON.stringify({ actual_airtime: actualAirtime, error: statumError.response?.data?.description || statumError.message || 'API call failed' })]
+            );
+            
+            res.status(500).json({ success: false, message: 'Airtime service error. Please try again.' });
         }
     } catch (error) {
         console.error('Buy airtime error:', error.response?.data || error);
@@ -894,26 +1012,47 @@ app.post('/api/airtime/direct', async (req, res) => {
             return res.status(400).json({ success: false, message: 'All fields are required' });
         }
         
-        if (parseFloat(amount) < 5) {
+        const purchaseAmount = parseFloat(amount);
+        
+        if (purchaseAmount < 5) {
             return res.status(400).json({ success: false, message: 'Minimum airtime is KES 5' });
         }
         
-        const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
-        if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
-            return res.status(503).json({ success: false, message: 'Airtime service temporarily unavailable.' });
+        const actualAirtime = calculateAirtimeCost(purchaseAmount);
+        
+        const statumBalance = await getStatumBalance();
+        console.log('Direct airtime - Statum balance check:', statumBalance);
+        
+        if (!statumBalance.success) {
+            return res.status(503).json({ 
+                success: false, 
+                message: 'Unable to verify airtime service. Please try again later.',
+                floatCheckFailed: true
+            });
+        }
+        
+        if (statumBalance.balance < actualAirtime) {
+            const maxPurchasable = Math.floor(statumBalance.balance / 0.9);
+            return res.status(400).json({
+                success: false,
+                message: `Airtime float is low. Maximum available is KES ${statumBalance.balance}. You can purchase up to KES ${maxPurchasable} worth.`,
+                floatLow: true,
+                availableFloat: statumBalance.balance,
+                maxPurchasable: maxPurchasable > 0 ? maxPurchasable : 0
+            });
         }
         
         const formattedPayPhone = phone_to_pay.startsWith('254') ? phone_to_pay : `254${phone_to_pay.replace(/^0/, '')}`;
         const formattedReceivePhone = phone_to_receive.startsWith('254') ? phone_to_receive : `254${phone_to_receive.replace(/^0/, '')}`;
         const reference = `DAIR-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-        const actualAirtime = calculateAirtimeCost(parseFloat(amount));
         
-        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payments/initiate', {
-            phone: formattedPayPhone,
-            amount: parseFloat(amount),
-            reference: paynectaReference,
-            callback_url: `${CALLBACK_BASE_URL}/api/payments/direct-airtime/callback`
-        }, {
+        const paynectaPayload = {
+            code: PAYNECTA_CODE,
+            mobile_number: formattedPayPhone,
+            amount: Math.round(purchaseAmount)
+        };
+        
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
             headers: {
                 'X-API-Key': PAYNECTA_API_KEY,
                 'X-User-Email': PAYNECTA_EMAIL,
@@ -921,11 +1060,14 @@ app.post('/api/airtime/direct', async (req, res) => {
             }
         });
         
-        if (paynectaResponse.data.success) {
+        if (paynectaResponse.data && paynectaResponse.data.success) {
+            const paynectaReference = paynectaResponse.data.data?.transaction_reference || null;
+            
             await pool.query(
-                `INSERT INTO pending_purchases (id, target_phone, amount, status, deposit_reference, initiated_at)
-                 VALUES ($1, $2, $3, 'awaiting_payment', $4, NOW())`,
-                [uuidv4(), formattedReceivePhone, actualAirtime, reference]
+                `INSERT INTO pending_purchases (id, target_phone, amount, status, deposit_reference, initiated_at, metadata)
+                 VALUES ($1, $2, $3, 'awaiting_payment', $4, NOW(), $5)`,
+                [uuidv4(), formattedReceivePhone, actualAirtime, reference, 
+                 JSON.stringify({ paynecta_reference: paynectaReference, pay_phone: formattedPayPhone })]
             );
             
             res.json({
@@ -935,7 +1077,7 @@ app.post('/api/airtime/direct', async (req, res) => {
                 airtime_to_receive: actualAirtime
             });
         } else {
-            res.status(400).json({ success: false, message: 'Payment initiation failed' });
+            res.status(400).json({ success: false, message: paynectaResponse.data?.message || 'Payment initiation failed' });
         }
     } catch (error) {
         console.error('Direct airtime error:', error.response?.data || error);
@@ -953,16 +1095,41 @@ async function processPendingAirtimePurchase(purchaseId, userId) {
         if (purchaseResult.rows.length === 0) return;
         
         const purchase = purchaseResult.rows[0];
+        const airtimeAmount = parseFloat(purchase.amount);
+        
+        const statumBalance = await getStatumBalance();
+        console.log('Processing pending purchase - Statum balance:', statumBalance);
+        
+        if (!statumBalance.success || statumBalance.balance < airtimeAmount) {
+            console.log(`Insufficient Statum float for pending purchase ${purchaseId}. Required: ${airtimeAmount}, Available: ${statumBalance.balance}`);
+            await pool.query(
+                `UPDATE pending_purchases SET status = 'float_low', metadata = $1 WHERE id = $2`,
+                [JSON.stringify({ 
+                    reason: 'Insufficient float', 
+                    required: airtimeAmount, 
+                    available: statumBalance.balance || 0 
+                }), purchaseId]
+            );
+            
+            await pool.query(
+                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                 VALUES ($1, $2, 'user', 'Airtime Delayed ⏳', $3, false, NOW())`,
+                [uuidv4(), userId, `Your airtime of KES ${airtimeAmount} to ${purchase.target_phone} is pending due to low float. We will process it when float is available.`]
+            );
+            return;
+        }
+        
         const statumAuth = Buffer.from(`${STATUM_CONSUMER_KEY}:${STATUM_CONSUMER_SECRET}`).toString('base64');
         
         const statumResponse = await axios.post('https://api.statum.co.ke/api/v2/airtime', {
             phone_number: purchase.target_phone,
-            amount: purchase.amount.toString()
+            amount: airtimeAmount.toString()
         }, {
             headers: {
                 'Authorization': `Basic ${statumAuth}`,
                 'Content-Type': 'application/json'
-            }
+            },
+            timeout: 30000
         });
         
         if (statumResponse.data.status_code === 200) {
@@ -971,7 +1138,7 @@ async function processPendingAirtimePurchase(purchaseId, userId) {
             await pool.query(
                 `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
                  VALUES ($1, $2, 'user', 'Airtime Sent! 📱', $3, false, NOW())`,
-                [uuidv4(), userId, `KES ${purchase.amount} airtime has been sent to ${purchase.target_phone}`]
+                [uuidv4(), userId, `KES ${airtimeAmount} airtime has been sent to ${purchase.target_phone}`]
             );
         } else {
             await pool.query(
