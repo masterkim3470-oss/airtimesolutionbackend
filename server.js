@@ -239,6 +239,16 @@ app.post('/api/payments/deposit', async (req, res) => {
         
         console.log('=== DEPOSIT REQUEST STARTED ===');
         console.log('Request body:', { phone, amount, email });
+        
+        const depositDisabledResult = await pool.query("SELECT value FROM settings WHERE key = 'deposit_disabled'");
+        if (depositDisabledResult.rows.length > 0 && depositDisabledResult.rows[0].value === 'true') {
+            return res.status(503).json({
+                success: false,
+                message: 'Deposits are temporarily disabled. Please try again later or contact support.',
+                errorType: 'deposit_disabled'
+            });
+        }
+        
         console.log('Environment check:');
         console.log('- PAYNECTA_API_KEY exists:', !!PAYNECTA_API_KEY);
         console.log('- PAYNECTA_API_KEY length:', PAYNECTA_API_KEY ? PAYNECTA_API_KEY.length : 0);
@@ -787,6 +797,15 @@ app.get('/api/airtime/float-status', async (req, res) => {
     }
 });
 
+function calculateCommission(amount) {
+    if (amount >= 50) {
+        return Math.floor(amount * 0.10);
+    } else if (amount >= 10) {
+        return 2;
+    }
+    return 0;
+}
+
 app.post('/api/airtime/buy', async (req, res) => {
     try {
         const { phone, amount, email } = req.body;
@@ -797,15 +816,6 @@ app.post('/api/airtime/buy', async (req, res) => {
         
         if (parseFloat(amount) < 5) {
             return res.status(400).json({ success: false, message: 'Minimum airtime is KES 5' });
-        }
-        
-        const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
-        if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
-            return res.status(503).json({ 
-                success: false, 
-                message: 'Low float balance - airtime service is temporarily paused. Please try again in a few minutes.',
-                errorType: 'float_low'
-            });
         }
         
         const userResult = await pool.query(
@@ -824,10 +834,20 @@ app.post('/api/airtime/buy', async (req, res) => {
         if (totalBalance < airtimeAmount) {
             return res.status(400).json({
                 success: false,
-                message: 'Insufficient balance',
+                message: 'Insufficient balance. Please top up your account first.',
                 balance: totalBalance,
                 required: airtimeAmount,
-                shortfall: airtimeAmount - totalBalance
+                shortfall: airtimeAmount - totalBalance,
+                errorType: 'insufficient_balance'
+            });
+        }
+        
+        const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
+        if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
+            return res.status(503).json({ 
+                success: false, 
+                message: 'Low float balance - airtime service is temporarily paused. Please try again in a few minutes.',
+                errorType: 'float_low'
             });
         }
         
@@ -866,21 +886,29 @@ app.post('/api/airtime/buy', async (req, res) => {
         });
         
         if (statumResponse.data.status_code === 200) {
+            const commission = calculateCommission(airtimeAmount);
+            
             await pool.query(
-                'UPDATE users SET balance = balance - $1, bonus_balance = bonus_balance - $2 WHERE id = $3',
-                [balanceUsed, bonusUsed, user.id]
+                'UPDATE users SET balance = balance - $1 + $2, bonus_balance = bonus_balance - $3 WHERE id = $4',
+                [balanceUsed, commission, bonusUsed, user.id]
             );
             
             await pool.query(
                 `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
-                [JSON.stringify({ actual_airtime: actualAirtime, statum_request_id: statumResponse.data.request_id }), transactionId]
+                [JSON.stringify({ actual_airtime: actualAirtime, statum_request_id: statumResponse.data.request_id, commission: commission }), transactionId]
             );
+            
+            let successMsg = `Airtime sent! KES ${actualAirtime} to ${formattedPhone}`;
+            if (commission > 0) {
+                successMsg += `. You earned KES ${commission} commission!`;
+            }
             
             res.json({
                 success: true,
-                message: `Airtime sent! KES ${actualAirtime} to ${formattedPhone}`,
+                message: successMsg,
                 airtimeSent: actualAirtime,
-                reference: reference
+                reference: reference,
+                commission: commission
             });
         } else {
             await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transactionId]);
@@ -1256,6 +1284,34 @@ app.put('/api/admin/float-status', adminAuth, async (req, res) => {
         res.json({ success: true, message: 'Float status updated' });
     } catch (error) {
         console.error('Set float status error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+app.get('/api/settings/deposit-status', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT value FROM settings WHERE key = 'deposit_disabled'");
+        const isDisabled = result.rows.length > 0 && result.rows[0].value === 'true';
+        res.json({ success: true, depositDisabled: isDisabled });
+    } catch (error) {
+        console.error('Get deposit status error:', error);
+        res.json({ success: true, depositDisabled: false });
+    }
+});
+
+app.put('/api/admin/deposit-status', adminAuth, async (req, res) => {
+    try {
+        const { isDisabled } = req.body;
+        
+        await pool.query(
+            `INSERT INTO settings (key, value) VALUES ('deposit_disabled', $1)
+             ON CONFLICT (key) DO UPDATE SET value = $1`,
+            [isDisabled.toString()]
+        );
+        
+        res.json({ success: true, message: 'Deposit status updated' });
+    } catch (error) {
+        console.error('Set deposit status error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
