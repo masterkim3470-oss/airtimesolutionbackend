@@ -137,7 +137,7 @@ app.post('/api/users/register', async (req, res) => {
         
         await pool.query(
             `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
-             VALUES ($1, $2, 'user', 'Welcome to Airtime Solution Kenya! 🎉', 'Thank you for joining us. Start by depositing funds to buy airtime.', false, NOW())`,
+             VALUES ($1, $2, 'user', 'Welcome to Airtime Solution Kenya! 🎉', 'Thank you for joining us. Start by depositing funds to buy and sell airtime and earn extra commission. other services includes; Bulk sms(coming soon),Airtime to cash(coming soon),surveys(coming soon) and lastly Bingwa bundles(coming soon).', false, NOW())`,
             [uuidv4(), id]
         );
         
