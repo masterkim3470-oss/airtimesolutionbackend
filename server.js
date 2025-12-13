@@ -77,6 +77,7 @@ const adminLoginLimiter = rateLimit({
 
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
+const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_609202';
 const STATUM_CONSUMER_KEY = process.env.STATUM_CONSUMER_KEY;
 const STATUM_CONSUMER_SECRET = process.env.STATUM_CONSUMER_SECRET;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '3462Abel@#';
@@ -276,22 +277,21 @@ app.post('/api/payments/deposit', async (req, res) => {
         );
         console.log('Transaction created:', transactionId);
         
-        const paynectaPayload = {
-            phone: formattedPhone,
-            amount: parseFloat(amount),
-            reference: reference,
-            callback_url: `${CALLBACK_BASE_URL}/api/payments/paynecta/callback`
-        };
+const paynectaPayload = {
+    code: PAYNECTA_CODE,
+    mobile_number: formattedPhone,
+    amount: Math.round(parseFloat(amount))
+};
         
         console.log('=== CALLING PAYNECTA API ===');
-        console.log('Paynecta URL: https://paynecta.co.ke/api/v1/payments/initiate');
+        console.log('Paynecta URL: https://paynecta.co.ke/api/v1/payment/initialize');
         console.log('Paynecta payload:', JSON.stringify(paynectaPayload));
         console.log('Headers being sent:', {
             'X-API-Key': PAYNECTA_API_KEY ? `${PAYNECTA_API_KEY.substring(0, 5)}...` : 'NOT SET',
             'X-User-Email': PAYNECTA_EMAIL || 'NOT SET'
         });
         
-        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payments/initiate', paynectaPayload, {
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
             headers: {
                 'X-API-Key': PAYNECTA_API_KEY,
                 'X-User-Email': PAYNECTA_EMAIL,
@@ -303,8 +303,15 @@ app.post('/api/payments/deposit', async (req, res) => {
         console.log('Status:', paynectaResponse.status);
         console.log('Response data:', JSON.stringify(paynectaResponse.data));
         
-        if (paynectaResponse.data.success) {
-            res.json({
+if (paynectaResponse.data && paynectaResponse.data.success) {
+    const paynectaReference = paynectaResponse.data.data?.transaction_reference || reference;
+    
+    await pool.query(
+        'UPDATE transactions SET reference = $1 WHERE id = $2',
+        [paynectaReference, transactionId]
+    );
+    
+    res.json({
                 success: true,
                 message: 'STK Push sent. Please enter your M-Pesa PIN.',
                 reference: reference,
@@ -623,7 +630,7 @@ app.post('/api/airtime/direct', async (req, res) => {
         const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payments/initiate', {
             phone: formattedPayPhone,
             amount: parseFloat(amount),
-            reference: reference,
+            reference: paynectaReference,
             callback_url: `${CALLBACK_BASE_URL}/api/payments/direct-airtime/callback`
         }, {
             headers: {
