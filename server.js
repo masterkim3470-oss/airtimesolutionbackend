@@ -304,12 +304,17 @@ const paynectaPayload = {
         console.log('Response data:', JSON.stringify(paynectaResponse.data));
         
 if (paynectaResponse.data && paynectaResponse.data.success) {
-    const paynectaReference = paynectaResponse.data.data?.transaction_reference || reference;
+    const paynectaReference = paynectaResponse.data.data?.transaction_reference || null;
     
+    // FIX: Store paynecta reference in metadata, NOT overwrite DEP- reference
+    // This ensures frontend polling works correctly with the original reference
     await pool.query(
-        'UPDATE transactions SET reference = $1 WHERE id = $2',
-        [paynectaReference, transactionId]
+        'UPDATE transactions SET metadata = $1 WHERE id = $2',
+        [JSON.stringify({ paynecta_reference: paynectaReference }), transactionId]
     );
+    
+    console.log('Stored paynecta_reference in metadata:', paynectaReference);
+    console.log('Keeping original reference for polling:', reference);
     
     res.json({
                 success: true,
@@ -342,40 +347,58 @@ if (paynectaResponse.data && paynectaResponse.data.success) {
 
 app.post('/api/payments/paynecta/callback', async (req, res) => {
     try {
-        console.log('Paynecta callback received:', JSON.stringify(req.body));
+        console.log('=== PAYNECTA CALLBACK RECEIVED ===');
+        console.log('Callback body:', JSON.stringify(req.body));
         
-        const { reference, status, mpesa_code, amount } = req.body;
+        const { reference, status, mpesa_code, amount, transaction_reference } = req.body;
         
-        if (!reference) {
+        // Get the reference from either field Paynecta might send
+        const callbackReference = reference || transaction_reference;
+        
+        if (!callbackReference) {
+            console.log('No reference in callback');
             return res.status(400).json({ success: false, message: 'Reference required' });
         }
         
-        if (!reference.startsWith('DEP-')) {
-            console.warn('Invalid reference format:', reference);
-            return res.status(400).json({ success: false, message: 'Invalid reference format' });
-        }
+        console.log('Looking up transaction with reference:', callbackReference);
         
-        const transactionResult = await pool.query(
+        // FIX: Search by either the DEP- reference OR the paynecta reference in metadata
+        let transactionResult = await pool.query(
             'SELECT id, user_id, amount, bonus, status FROM transactions WHERE reference = $1',
-            [reference]
+            [callbackReference]
         );
         
+        // If not found by reference, search in metadata for paynecta_reference
         if (transactionResult.rows.length === 0) {
-            console.warn('Transaction not found for reference:', reference);
+            console.log('Not found by reference, searching in metadata...');
+            transactionResult = await pool.query(
+                `SELECT id, user_id, amount, bonus, status FROM transactions 
+                 WHERE metadata->>'paynecta_reference' = $1`,
+                [callbackReference]
+            );
+        }
+        
+        if (transactionResult.rows.length === 0) {
+            console.warn('Transaction not found for reference:', callbackReference);
             return res.status(404).json({ success: false, message: 'Transaction not found' });
         }
         
         const transaction = transactionResult.rows[0];
+        console.log('Found transaction:', transaction.id, 'Current status:', transaction.status);
         
         if (transaction.status !== 'pending') {
-            console.log('Transaction already processed:', reference, transaction.status);
+            console.log('Transaction already processed:', callbackReference, transaction.status);
             return res.json({ success: true, message: 'Transaction already processed' });
         }
         
-        if (status === 'success' || status === 'completed') {
+        // Normalize status check to handle different formats
+        const normalizedStatus = (status || '').toLowerCase();
+        if (normalizedStatus === 'success' || normalizedStatus === 'completed' || normalizedStatus === 'successful') {
+            console.log('Payment successful, updating transaction and balance...');
+            
             await pool.query(
                 `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
-                [JSON.stringify({ mpesa_code }), transaction.id]
+                [JSON.stringify({ mpesa_code, paynecta_reference: callbackReference }), transaction.id]
             );
             
             const totalAmount = parseFloat(transaction.amount);
@@ -384,6 +407,13 @@ app.post('/api/payments/paynecta/callback', async (req, res) => {
             await pool.query(
                 'UPDATE users SET balance = balance + $1, bonus_balance = bonus_balance + $2 WHERE id = $3',
                 [totalAmount, bonus, transaction.user_id]
+            );
+            
+            // Add notification for successful deposit
+            await pool.query(
+                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                 VALUES ($1, $2, 'user', 'Deposit Successful! 💰', $3, false, NOW())`,
+                [uuidv4(), transaction.user_id, `KES ${totalAmount} has been added to your account${bonus > 0 ? ` plus KES ${bonus} bonus!` : '.'}`]
             );
             
             const pendingPurchase = await pool.query(
@@ -400,6 +430,7 @@ app.post('/api/payments/paynecta/callback', async (req, res) => {
             
             console.log(`Deposit successful for user ${transaction.user_id}: KES ${totalAmount} + ${bonus} bonus`);
         } else {
+            console.log('Payment failed/cancelled, status:', status);
             await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transaction.id]);
         }
         
@@ -484,12 +515,102 @@ app.post('/api/payments/payhero-link', async (req, res) => {
         
         const formattedPhone = phone.startsWith('254') ? phone : `254${phone.replace(/^0/, '')}`;
         
-        const payHeroUrl = `${PAYHERO_LINK}?phone=${formattedPhone}&amount=${amount}&name=${encodeURIComponent(email)}&reference=${encodeURIComponent('#airtime deposit')}`;
+        // Use customer_name for email so PayHero callback can identify user
+        const payHeroUrl = `${PAYHERO_LINK}?phone=${formattedPhone}&amount=${amount}&customer_name=${encodeURIComponent(email)}&reference=${encodeURIComponent('#airtime deposit')}`;
         
         res.json({ success: true, paymentLink: payHeroUrl });
     } catch (error) {
         console.error('PayHero link error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// PayHero webhook endpoint for deposits via payment link
+app.post('/api/payments/payhero/callback', async (req, res) => {
+    try {
+        console.log('=== PAYHERO CALLBACK RECEIVED ===');
+        console.log('Callback body:', JSON.stringify(req.body));
+        
+        const { 
+            status, 
+            amount, 
+            phone, 
+            customer_name, 
+            reference,
+            mpesa_reference,
+            checkout_request_id 
+        } = req.body;
+        
+        // customer_name contains the email
+        const email = customer_name;
+        
+        if (!email) {
+            console.log('No email in PayHero callback');
+            return res.status(400).json({ success: false, message: 'Customer email required' });
+        }
+        
+        const normalizedStatus = (status || '').toLowerCase();
+        
+        if (normalizedStatus === 'success' || normalizedStatus === 'completed' || normalizedStatus === 'successful') {
+            console.log('PayHero payment successful for:', email, 'Amount:', amount);
+            
+            // Find the user
+            const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+            
+            if (userResult.rows.length === 0) {
+                console.log('User not found for email:', email);
+                return res.status(404).json({ success: false, message: 'User not found' });
+            }
+            
+            const userId = userResult.rows[0].id;
+            const depositAmount = parseFloat(amount);
+            const bonus = calculateBonus(depositAmount);
+            const transactionRef = `PHERO-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+            
+            // Check if this payment was already processed (by mpesa_reference)
+            if (mpesa_reference) {
+                const existingTx = await pool.query(
+                    `SELECT id FROM transactions WHERE metadata->>'mpesa_code' = $1 AND status = 'completed'`,
+                    [mpesa_reference]
+                );
+                
+                if (existingTx.rows.length > 0) {
+                    console.log('PayHero payment already processed:', mpesa_reference);
+                    return res.json({ success: true, message: 'Payment already processed' });
+                }
+            }
+            
+            // Create completed transaction
+            await pool.query(
+                `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
+                 VALUES ($1, $2, 'deposit', $3, 0, $4, 'completed', 'payhero', $5, $6, $7, NOW())`,
+                [uuidv4(), userId, depositAmount, bonus, phone, transactionRef, JSON.stringify({ 
+                    mpesa_code: mpesa_reference,
+                    checkout_request_id,
+                    original_reference: reference
+                })]
+            );
+            
+            // Update user balance immediately
+            await pool.query(
+                'UPDATE users SET balance = balance + $1, bonus_balance = bonus_balance + $2 WHERE id = $3',
+                [depositAmount, bonus, userId]
+            );
+            
+            console.log(`PayHero deposit successful for user ${userId}: KES ${depositAmount} + ${bonus} bonus`);
+            
+            // Add notification
+            await pool.query(
+                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                 VALUES ($1, $2, 'user', 'Deposit Successful! 💰', $3, false, NOW())`,
+                [uuidv4(), userId, `KES ${depositAmount} has been added to your account via PayHero${bonus > 0 ? ` plus KES ${bonus} bonus!` : '.'}`]
+            );
+        }
+        
+        res.json({ success: true, message: 'PayHero callback processed' });
+    } catch (error) {
+        console.error('PayHero callback error:', error);
+        res.status(500).json({ success: false, message: 'Callback processing error' });
     }
 });
 
