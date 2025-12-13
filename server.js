@@ -11,8 +11,9 @@ const cookieParser = require('cookie-parser');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
 
+const path = require('path');
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 5000;
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -30,9 +31,10 @@ pool.connect((err, client, release) => {
 
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({
-    origin: 'https://airtimesolutionfrontend.onrender.com',
+    origin: true,
     credentials: true
 }));
+app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -799,7 +801,11 @@ app.post('/api/airtime/buy', async (req, res) => {
         
         const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
         if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
-            return res.status(503).json({ success: false, message: 'Airtime service temporarily unavailable. Please try again later.' });
+            return res.status(503).json({ 
+                success: false, 
+                message: 'Low float balance - airtime service is temporarily paused. Please try again in a few minutes.',
+                errorType: 'float_low'
+            });
         }
         
         const userResult = await pool.query(
@@ -900,7 +906,11 @@ app.post('/api/airtime/direct', async (req, res) => {
         
         const floatResult = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
         if (floatResult.rows.length > 0 && floatResult.rows[0].value === 'true') {
-            return res.status(503).json({ success: false, message: 'Airtime service temporarily unavailable.' });
+            return res.status(503).json({ 
+                success: false, 
+                message: 'Low float balance - airtime service is temporarily paused. Please try again in a few minutes.',
+                errorType: 'float_low'
+            });
         }
         
         const formattedPayPhone = phone_to_pay.startsWith('254') ? phone_to_pay : `254${phone_to_pay.replace(/^0/, '')}`;
@@ -1254,13 +1264,31 @@ app.post('/api/admin/notifications', adminAuth, async (req, res) => {
     try {
         const { title, message, userId } = req.body;
         
+        if (!title || !message) {
+            return res.status(400).json({ success: false, message: 'Title and message are required' });
+        }
+        
+        const validUserId = userId && typeof userId === 'string' && userId.trim() !== '' ? userId.trim() : null;
+        
+        if (validUserId) {
+            const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [validUserId]);
+            if (userCheck.rows.length === 0) {
+                return res.status(400).json({ success: false, message: 'Selected user not found' });
+            }
+        }
+        
+        const scope = validUserId ? 'user' : 'system';
+        
+        console.log('Sending notification:', { title, userId: validUserId, scope });
+        
         await pool.query(
             `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
              VALUES ($1, $2, $3, $4, $5, false, NOW())`,
-            [uuidv4(), userId || null, userId ? 'user' : 'system', title, message]
+            [uuidv4(), validUserId, scope, title, message]
         );
         
-        res.json({ success: true, message: 'Notification sent' });
+        const recipientMsg = validUserId ? 'Notification sent to selected user' : 'Notification sent to all users';
+        res.json({ success: true, message: recipientMsg });
     } catch (error) {
         console.error('Send notification error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
@@ -1307,11 +1335,7 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/', (req, res) => {
-    res.json({ 
-        message: 'Airtime Solution Kenya API', 
-        status: 'running',
-        frontend: process.env.FRONTEND_ORIGIN || 'https://airtimesolutionfrontend.onrender.com'
-    });
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 app.listen(PORT, '0.0.0.0', () => {
