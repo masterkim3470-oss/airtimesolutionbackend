@@ -60,16 +60,15 @@ app.use((req, res, next) => {
     next();
 });
 
-const limiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
+ const limiter = rateLimit({
+    windowMs: 5 * 60 * 1000,  // 5 minutes (shorter window)
+    max: 500,                  // 500 requests per 5 min
     message: { success: false, message: 'Too many requests, please try again later.' }
 });
-app.use('/api/', limiter);
 
 const adminLoginLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 5,
+    windowMs: 15 * 60 * 1000,  // Keep 15 minutes for security
+    max: 10,                    // 10 attempts
     message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' },
     standardHeaders: true,
     legacyHeaders: false
