@@ -916,7 +916,7 @@ app.post('/api/airtime/buy', async (req, res) => {
         }
     } catch (error) {
         console.error('Buy airtime error:', error.response?.data || error);
-        res.status(500).json({ success: false, message: 'Airtime service error. Please try again.' });
+        res.status(500).json({ success: false, message: 'Airtime service error Reason:low float. Please try again later.' });
     }
 });
 
