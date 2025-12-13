@@ -244,7 +244,7 @@ app.post('/api/payments/deposit', async (req, res) => {
         if (depositDisabledResult.rows.length > 0 && depositDisabledResult.rows[0].value === 'true') {
             return res.status(503).json({
                 success: false,
-                message: 'Deposits are temporarily disabled. Please try again later or contact support.',
+                message: 'Deposits are temporarily disabled by admin. Please try again later or contact support 0718369524',
                 errorType: 'deposit_disabled'
             });
         }
