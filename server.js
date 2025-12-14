@@ -62,11 +62,13 @@ app.use((req, res, next) => {
     next();
 });
 
- const limiter = rateLimit({
-    windowMs: 5 * 60 * 1000,  // 5 minutes (shorter window)
-    max: 500,                  // 500 requests per 5 min
+const limiter = rateLimit({
+    windowMs: 5 * 60 * 1000,
+    max: 500,
     message: { success: false, message: 'Too many requests, please try again later.' }
 });
+
+app.use('/api/', limiter);
 
 const adminLoginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,  // Keep 15 minutes for security
@@ -1285,6 +1287,17 @@ app.put('/api/admin/float-status', adminAuth, async (req, res) => {
     } catch (error) {
         console.error('Set float status error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+app.get('/api/settings/float-status', async (req, res) => {
+    try {
+        const result = await pool.query("SELECT value FROM settings WHERE key = 'float_low'");
+        const isLow = result.rows.length > 0 && result.rows[0].value === 'true';
+        res.json({ success: true, floatLow: isLow });
+    } catch (error) {
+        console.error('Get float status error:', error);
+        res.json({ success: true, floatLow: false });
     }
 });
 
