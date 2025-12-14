@@ -983,6 +983,140 @@ app.post('/api/airtime/direct', async (req, res) => {
     }
 });
 
+const directBuyTransactions = new Map();
+
+app.post('/api/direct-buy/initiate', async (req, res) => {
+    try {
+        const { phone, network, amount } = req.body;
+        
+        if (!phone || !network || !amount) {
+            return res.status(400).json({ success: false, message: 'Phone, network, and amount are required' });
+        }
+        
+        if (parseInt(amount) < 10) {
+            return res.status(400).json({ success: false, message: 'Minimum amount is KES 10' });
+        }
+        
+        const formattedPhone = phone.startsWith('254') ? phone : `254${phone.replace(/^0/, '')}`;
+        const reference = `DIRECT-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        const airtimeToReceive = parseInt(amount);
+        
+        const paynectaPayload = {
+            code: PAYNECTA_CODE,
+            mobile_number: formattedPhone,
+            amount: Math.round(parseFloat(amount))
+        };
+        
+        console.log('=== DIRECT BUY INITIATED ===');
+        console.log('Phone:', formattedPhone, 'Network:', network, 'Amount:', amount);
+        
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        if (paynectaResponse.data && paynectaResponse.data.success) {
+            const paynectaRef = paynectaResponse.data.data?.transaction_reference || null;
+            
+            directBuyTransactions.set(reference, {
+                phone: formattedPhone,
+                network: network,
+                amount: parseInt(amount),
+                airtime: airtimeToReceive,
+                status: 'pending',
+                paynecta_reference: paynectaRef,
+                created_at: new Date().toISOString()
+            });
+            
+            res.json({
+                success: true,
+                message: 'STK Push sent. Enter your M-Pesa PIN.',
+                reference: reference,
+                airtime_to_receive: airtimeToReceive
+            });
+        } else {
+            res.status(400).json({ success: false, message: paynectaResponse.data.message || 'Payment initiation failed' });
+        }
+    } catch (error) {
+        console.error('Direct buy error:', error.response?.data || error);
+        res.status(500).json({ success: false, message: 'Service error. Please try again.' });
+    }
+});
+
+app.get('/api/direct-buy/status/:reference', async (req, res) => {
+    try {
+        const { reference } = req.params;
+        const transaction = directBuyTransactions.get(reference);
+        
+        if (!transaction) {
+            return res.status(404).json({ success: false, message: 'Transaction not found', status: 'not_found' });
+        }
+        
+        if (transaction.status === 'pending' && transaction.paynecta_reference && PAYNECTA_API_KEY) {
+            try {
+                const statusResponse = await axios.get(
+                    `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(transaction.paynecta_reference)}`,
+                    {
+                        headers: {
+                            'X-API-Key': PAYNECTA_API_KEY,
+                            'X-User-Email': PAYNECTA_EMAIL
+                        },
+                        timeout: 10000
+                    }
+                );
+                
+                if (statusResponse.data?.success && statusResponse.data.data) {
+                    const paynectaStatus = (statusResponse.data.data.status || '').toLowerCase();
+                    
+                    if (paynectaStatus === 'completed') {
+                        transaction.status = 'payment_completed';
+                        await sendDirectBuyAirtime(reference, transaction);
+                    } else if (paynectaStatus === 'failed' || paynectaStatus === 'cancelled') {
+                        transaction.status = 'failed';
+                    }
+                }
+            } catch (err) {
+                console.error('Status check error:', err);
+            }
+        }
+        
+        res.json({ success: true, status: transaction.status, airtime: transaction.airtime });
+    } catch (error) {
+        console.error('Direct buy status error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+async function sendDirectBuyAirtime(reference, transaction) {
+    try {
+        const statumAuth = Buffer.from(`${STATUM_CONSUMER_KEY}:${STATUM_CONSUMER_SECRET}`).toString('base64');
+        
+        const statumResponse = await axios.post('https://api.statum.co.ke/api/v2/airtime', {
+            phone_number: transaction.phone,
+            amount: transaction.airtime.toString()
+        }, {
+            headers: {
+                'Authorization': `Basic ${statumAuth}`,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        if (statumResponse.data.status_code === 200) {
+            transaction.status = 'completed';
+            console.log(`Direct buy airtime sent: ${transaction.airtime} to ${transaction.phone}`);
+        } else {
+            transaction.status = 'airtime_failed';
+            console.error('Statum failed:', statumResponse.data);
+        }
+    } catch (error) {
+        transaction.status = 'airtime_failed';
+        console.error('Send airtime error:', error.response?.data || error);
+    }
+}
+
 async function processPendingAirtimePurchase(purchaseId, userId) {
     try {
         const purchaseResult = await pool.query(
