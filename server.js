@@ -34,7 +34,7 @@ app.use(cors({
     origin: true,
     credentials: true
 }));
-app.use(express.static(path.join(__dirname, 'public')));
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());
@@ -78,6 +78,14 @@ const adminLoginLimiter = rateLimit({
     legacyHeaders: false
 });
 
+ // Root route for API health check
+app.get('/', (req, res) => {
+    res.json({ 
+        success: true, 
+        message: 'Airtime Solution Kenya API is running',
+        status: 'online'
+    });
+});
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
 const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_609202';
