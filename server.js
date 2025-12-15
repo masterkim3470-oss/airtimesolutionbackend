@@ -78,12 +78,13 @@ const adminLoginLimiter = rateLimit({
     legacyHeaders: false
 });
 
-// Serve static files
-app.use(express.static(path.join(__dirname, '.')));
-
-// Root route serves index.html
+ // Root route for API health check
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.json({ 
+        success: true, 
+        message: 'Airtime Solution Kenya API is running',
+        status: 'online'
+    });
 });
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
@@ -1273,121 +1274,6 @@ app.put('/api/notifications/:id/read', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
-
-// ============ LOAN SYSTEM ENDPOINTS ============
-
-const loanPaymentTracking = new Map();
-
-app.post('/api/loan/stk-push', async (req, res) => {
-    try {
-        const { phone, amount, loanId, description } = req.body;
-        
-        if (!phone || !amount) {
-            return res.status(400).json({ success: false, message: 'Phone and amount are required' });
-        }
-        
-        console.log('=== LOAN STK PUSH REQUEST ===');
-        console.log('Phone:', phone, 'Amount:', amount, 'Loan ID:', loanId);
-        
-        const formattedPhone = phone.startsWith('254') ? phone : '254' + phone.replace(/^0+/, '');
-        const requestId = 'LOAN-' + uuidv4().substring(0, 8).toUpperCase();
-        
-        const paynectaPayload = {
-            code: PAYNECTA_CODE,
-            phone: formattedPhone,
-            amount: parseInt(amount)
-        };
-        
-        console.log('Calling Paynecta for loan savings deposit...');
-        console.log('Payload:', paynectaPayload);
-        
-        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
-            headers: {
-                'X-API-Key': PAYNECTA_API_KEY,
-                'X-User-Email': PAYNECTA_EMAIL,
-                'Content-Type': 'application/json'
-            }
-        });
-        
-        console.log('Paynecta response:', paynectaResponse.data);
-        
-        if (paynectaResponse.data && paynectaResponse.data.success) {
-            const paynectaReference = paynectaResponse.data.data?.transaction_reference || null;
-            
-            loanPaymentTracking.set(requestId, {
-                status: 'pending',
-                phone: formattedPhone,
-                amount: amount,
-                loanId: loanId,
-                paynectaReference: paynectaReference,
-                createdAt: new Date()
-            });
-            
-            res.json({
-                success: true,
-                message: 'STK Push sent successfully',
-                requestId: requestId,
-                checkoutRequestId: paynectaReference || requestId
-            });
-        } else {
-            console.log('Paynecta loan payment failed:', paynectaResponse.data?.message);
-            res.status(400).json({ success: false, message: paynectaResponse.data?.message || 'Payment initiation failed' });
-        }
-    } catch (error) {
-        console.error('Loan STK Push error:', error.response?.data || error.message);
-        res.status(500).json({ success: false, message: 'Payment service error' });
-    }
-});
-
-app.get('/api/loan/payment-status/:requestId', async (req, res) => {
-    try {
-        const { requestId } = req.params;
-        
-        const tracking = loanPaymentTracking.get(requestId);
-        
-        if (!tracking) {
-            return res.json({ status: 'unknown', message: 'Payment not found' });
-        }
-        
-        if (tracking.paynectaReference && PAYNECTA_API_KEY) {
-            try {
-                const statusResponse = await axios.get(
-                    `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(tracking.paynectaReference)}`,
-                    {
-                        headers: {
-                            'X-API-Key': PAYNECTA_API_KEY,
-                            'X-User-Email': PAYNECTA_EMAIL
-                        }
-                    }
-                );
-                
-                if (statusResponse.data?.data) {
-                    const paymentData = statusResponse.data.data;
-                    const paynectaStatus = (paymentData.status || '').toLowerCase();
-                    
-                    if (paynectaStatus === 'completed') {
-                        tracking.status = 'completed';
-                        loanPaymentTracking.set(requestId, tracking);
-                        return res.json({ status: 'completed', success: true, mpesaCode: paymentData.mpesa_receipt });
-                    } else if (paynectaStatus === 'failed' || paynectaStatus === 'cancelled') {
-                        tracking.status = 'failed';
-                        loanPaymentTracking.set(requestId, tracking);
-                        return res.json({ status: 'failed', message: 'Payment was cancelled or failed' });
-                    }
-                }
-            } catch (pollError) {
-                console.log('Loan payment polling error:', pollError.message);
-            }
-        }
-        
-        res.json({ status: tracking.status });
-    } catch (error) {
-        console.error('Loan payment status error:', error);
-        res.status(500).json({ status: 'error', message: 'Server error' });
-    }
-});
-
-// ============ END LOAN SYSTEM ENDPOINTS ============
 
 app.post('/api/admin/login', adminLoginLimiter, (req, res) => {
     const { password } = req.body;
