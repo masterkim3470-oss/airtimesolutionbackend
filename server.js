@@ -1570,98 +1570,122 @@ app.get('/api/settings/float-status', async (req, res) => {
     }
 });
 
-// ============ SAVINGS BALANCE ENDPOINTS ============
-
-// Initialize savings_balance column if not exists
-async function initSavingsColumn() {
+app.get('/api/settings/deposit-status', async (req, res) => {
     try {
-        await pool.query(`
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS savings_balance DECIMAL(10,2) DEFAULT 0
-        `);
-        console.log('Savings balance column initialized');
+        const result = await pool.query("SELECT value FROM settings WHERE key = 'deposit_disabled'");
+        const isDisabled = result.rows.length > 0 && result.rows[0].value === 'true';
+        res.json({ success: true, depositDisabled: isDisabled });
     } catch (error) {
-        console.log('Savings column check:', error.message);
-    }
-}
-initSavingsColumn();
-
-// Get user savings balance
-app.get('/api/users/savings/:email', async (req, res) => {
-    try {
-        const { email } = req.params;
-        const result = await pool.query(
-            'SELECT COALESCE(savings_balance, 0) as savings_balance FROM users WHERE LOWER(email) = LOWER($1)',
-            [email]
-        );
-        
-        if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'User not found' });
-        }
-        
-        res.json({
-            success: true,
-            savings_balance: parseFloat(result.rows[0].savings_balance) || 0
-        });
-    } catch (error) {
-        console.error('Get savings balance error:', error);
-        res.status(500).json({ success: false, message: 'Server error' });
+        console.error('Get deposit status error:', error);
+        res.json({ success: true, depositDisabled: false });
     }
 });
 
-// Add to savings balance (for loan deposits)
-app.post('/api/users/savings/deposit', async (req, res) => {
+app.put('/api/admin/deposit-status', adminAuth, async (req, res) => {
     try {
-        const { email, amount } = req.body;
-        
-        if (!email || !amount || parseFloat(amount) <= 0) {
-            return res.status(400).json({ success: false, message: 'Email and valid amount required' });
-        }
-        
-        const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email]);
-        if (userResult.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'User not found' });
-        }
+        const { isDisabled } = req.body;
         
         await pool.query(
-            'UPDATE users SET savings_balance = COALESCE(savings_balance, 0) + $1 WHERE id = $2',
-            [parseFloat(amount), userResult.rows[0].id]
+            `INSERT INTO settings (key, value) VALUES ('deposit_disabled', $1)
+             ON CONFLICT (key) DO UPDATE SET value = $1`,
+            [isDisabled.toString()]
         );
         
-        res.json({ success: true, message: 'Savings deposited successfully' });
+        res.json({ success: true, message: 'Deposit status updated' });
     } catch (error) {
-        console.error('Savings deposit error:', error);
+        console.error('Set deposit status error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
-// Get full user balance including savings
-app.get('/api/users/full-balance/:email', async (req, res) => {
+app.post('/api/admin/notifications', adminAuth, async (req, res) => {
     try {
-        const { email } = req.params;
-        const result = await pool.query(
-            'SELECT balance, bonus_balance, COALESCE(savings_balance, 0) as savings_balance FROM users WHERE LOWER(email) = LOWER($1)',
-            [email]
+        const { title, message, userId } = req.body;
+        
+        if (!title || !message) {
+            return res.status(400).json({ success: false, message: 'Title and message are required' });
+        }
+        
+        const validUserId = userId && typeof userId === 'string' && userId.trim() !== '' ? userId.trim() : null;
+        
+        if (validUserId) {
+            const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [validUserId]);
+            if (userCheck.rows.length === 0) {
+                return res.status(400).json({ success: false, message: 'Selected user not found' });
+            }
+        }
+        
+        const scope = validUserId ? 'user' : 'system';
+        
+        console.log('Sending notification:', { title, userId: validUserId, scope });
+        
+        await pool.query(
+            `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+             VALUES ($1, $2, $3, $4, $5, false, NOW())`,
+            [uuidv4(), validUserId, scope, title, message]
         );
         
-        if (result.rows.length === 0) {
-            return res.status(404).json({ success: false, message: 'User not found' });
-        }
+        const recipientMsg = validUserId ? 'Notification sent to selected user' : 'Notification sent to all users';
+        res.json({ success: true, message: recipientMsg });
+    } catch (error) {
+        console.error('Send notification error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+app.get('/api/admin/stats', adminAuth, async (req, res) => {
+    try {
+        const users = await pool.query('SELECT COUNT(*) FROM users');
+        const totalDeposits = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'deposit' AND status = 'completed'");
+        const totalAirtime = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'airtime' AND status = 'completed'");
+        const pendingVerifications = await pool.query("SELECT COUNT(*) FROM deposit_verifications WHERE status = 'pending'");
         
         res.json({
             success: true,
-            balance: parseFloat(result.rows[0].balance),
-            bonus: parseFloat(result.rows[0].bonus_balance),
-            savings: parseFloat(result.rows[0].savings_balance) || 0,
-            total: parseFloat(result.rows[0].balance) + parseFloat(result.rows[0].bonus_balance)
+            stats: {
+                totalUsers: parseInt(users.rows[0].count),
+                totalDeposits: parseFloat(totalDeposits.rows[0].total),
+                totalAirtime: parseFloat(totalAirtime.rows[0].total),
+                pendingVerifications: parseInt(pendingVerifications.rows[0].count)
+            }
         });
     } catch (error) {
-        console.error('Get full balance error:', error);
+        console.error('Get stats error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
-// ============ END SAVINGS BALANCE ENDPOINTS ============
+app.post('/api/admin/logout', (req, res) => {
+    req.session.destroy();
+    res.json({ success: true, message: 'Logged out' });
+});
+
+app.post('/api/airtime-to-cash/initiate', async (req, res) => {
+    res.status(503).json({ 
+        success: false, 
+        message: 'Airtime to Cash feature coming soon!',
+        comingSoon: true
+    });
+});
+
+app.get('/api/health', (req, res) => {
+    res.json({ status: 'OK', timestamp: new Date().toISOString() });
+});
+
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
+    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://airtimesolution-auto.onrender.com'}`);
+    console.log(`Callback URL: ${CALLBACK_BASE_URL}`);
+});
+
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    pool.end(() => {
+        console.log('Database pool closed');
+        process.exit(0);
+    });
 });
