@@ -78,13 +78,12 @@ const adminLoginLimiter = rateLimit({
     legacyHeaders: false
 });
 
- // Root route for API health check
+// Serve static files
+app.use(express.static(path.join(__dirname, '.')));
+
+// Root route serves index.html
 app.get('/', (req, res) => {
-    res.json({ 
-        success: true, 
-        message: 'Airtime Solution Kenya API is running',
-        status: 'online'
-    });
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
@@ -1275,6 +1274,121 @@ app.put('/api/notifications/:id/read', async (req, res) => {
     }
 });
 
+// ============ LOAN SYSTEM ENDPOINTS ============
+
+const loanPaymentTracking = new Map();
+
+app.post('/api/loan/stk-push', async (req, res) => {
+    try {
+        const { phone, amount, loanId, description } = req.body;
+        
+        if (!phone || !amount) {
+            return res.status(400).json({ success: false, message: 'Phone and amount are required' });
+        }
+        
+        console.log('=== LOAN STK PUSH REQUEST ===');
+        console.log('Phone:', phone, 'Amount:', amount, 'Loan ID:', loanId);
+        
+        const formattedPhone = phone.startsWith('254') ? phone : '254' + phone.replace(/^0+/, '');
+        const requestId = 'LOAN-' + uuidv4().substring(0, 8).toUpperCase();
+        
+        const paynectaPayload = {
+            code: PAYNECTA_CODE,
+            phone: formattedPhone,
+            amount: parseInt(amount)
+        };
+        
+        console.log('Calling Paynecta for loan savings deposit...');
+        console.log('Payload:', paynectaPayload);
+        
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        console.log('Paynecta response:', paynectaResponse.data);
+        
+        if (paynectaResponse.data && paynectaResponse.data.success) {
+            const paynectaReference = paynectaResponse.data.data?.transaction_reference || null;
+            
+            loanPaymentTracking.set(requestId, {
+                status: 'pending',
+                phone: formattedPhone,
+                amount: amount,
+                loanId: loanId,
+                paynectaReference: paynectaReference,
+                createdAt: new Date()
+            });
+            
+            res.json({
+                success: true,
+                message: 'STK Push sent successfully',
+                requestId: requestId,
+                checkoutRequestId: paynectaReference || requestId
+            });
+        } else {
+            console.log('Paynecta loan payment failed:', paynectaResponse.data?.message);
+            res.status(400).json({ success: false, message: paynectaResponse.data?.message || 'Payment initiation failed' });
+        }
+    } catch (error) {
+        console.error('Loan STK Push error:', error.response?.data || error.message);
+        res.status(500).json({ success: false, message: 'Payment service error' });
+    }
+});
+
+app.get('/api/loan/payment-status/:requestId', async (req, res) => {
+    try {
+        const { requestId } = req.params;
+        
+        const tracking = loanPaymentTracking.get(requestId);
+        
+        if (!tracking) {
+            return res.json({ status: 'unknown', message: 'Payment not found' });
+        }
+        
+        if (tracking.paynectaReference && PAYNECTA_API_KEY) {
+            try {
+                const statusResponse = await axios.get(
+                    `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(tracking.paynectaReference)}`,
+                    {
+                        headers: {
+                            'X-API-Key': PAYNECTA_API_KEY,
+                            'X-User-Email': PAYNECTA_EMAIL
+                        }
+                    }
+                );
+                
+                if (statusResponse.data?.data) {
+                    const paymentData = statusResponse.data.data;
+                    const paynectaStatus = (paymentData.status || '').toLowerCase();
+                    
+                    if (paynectaStatus === 'completed') {
+                        tracking.status = 'completed';
+                        loanPaymentTracking.set(requestId, tracking);
+                        return res.json({ status: 'completed', success: true, mpesaCode: paymentData.mpesa_receipt });
+                    } else if (paynectaStatus === 'failed' || paynectaStatus === 'cancelled') {
+                        tracking.status = 'failed';
+                        loanPaymentTracking.set(requestId, tracking);
+                        return res.json({ status: 'failed', message: 'Payment was cancelled or failed' });
+                    }
+                }
+            } catch (pollError) {
+                console.log('Loan payment polling error:', pollError.message);
+            }
+        }
+        
+        res.json({ status: tracking.status });
+    } catch (error) {
+        console.error('Loan payment status error:', error);
+        res.status(500).json({ status: 'error', message: 'Server error' });
+    }
+});
+
+// ============ END LOAN SYSTEM ENDPOINTS ============
+
 app.post('/api/admin/login', adminLoginLimiter, (req, res) => {
     const { password } = req.body;
     
@@ -1456,122 +1570,98 @@ app.get('/api/settings/float-status', async (req, res) => {
     }
 });
 
-app.get('/api/settings/deposit-status', async (req, res) => {
-    try {
-        const result = await pool.query("SELECT value FROM settings WHERE key = 'deposit_disabled'");
-        const isDisabled = result.rows.length > 0 && result.rows[0].value === 'true';
-        res.json({ success: true, depositDisabled: isDisabled });
-    } catch (error) {
-        console.error('Get deposit status error:', error);
-        res.json({ success: true, depositDisabled: false });
-    }
-});
+// ============ SAVINGS BALANCE ENDPOINTS ============
 
-app.put('/api/admin/deposit-status', adminAuth, async (req, res) => {
+// Initialize savings_balance column if not exists
+async function initSavingsColumn() {
     try {
-        const { isDisabled } = req.body;
-        
-        await pool.query(
-            `INSERT INTO settings (key, value) VALUES ('deposit_disabled', $1)
-             ON CONFLICT (key) DO UPDATE SET value = $1`,
-            [isDisabled.toString()]
+        await pool.query(`
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS savings_balance DECIMAL(10,2) DEFAULT 0
+        `);
+        console.log('Savings balance column initialized');
+    } catch (error) {
+        console.log('Savings column check:', error.message);
+    }
+}
+initSavingsColumn();
+
+// Get user savings balance
+app.get('/api/users/savings/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const result = await pool.query(
+            'SELECT COALESCE(savings_balance, 0) as savings_balance FROM users WHERE LOWER(email) = LOWER($1)',
+            [email]
         );
         
-        res.json({ success: true, message: 'Deposit status updated' });
-    } catch (error) {
-        console.error('Set deposit status error:', error);
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
-app.post('/api/admin/notifications', adminAuth, async (req, res) => {
-    try {
-        const { title, message, userId } = req.body;
-        
-        if (!title || !message) {
-            return res.status(400).json({ success: false, message: 'Title and message are required' });
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'User not found' });
         }
-        
-        const validUserId = userId && typeof userId === 'string' && userId.trim() !== '' ? userId.trim() : null;
-        
-        if (validUserId) {
-            const userCheck = await pool.query('SELECT id FROM users WHERE id = $1', [validUserId]);
-            if (userCheck.rows.length === 0) {
-                return res.status(400).json({ success: false, message: 'Selected user not found' });
-            }
-        }
-        
-        const scope = validUserId ? 'user' : 'system';
-        
-        console.log('Sending notification:', { title, userId: validUserId, scope });
-        
-        await pool.query(
-            `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
-             VALUES ($1, $2, $3, $4, $5, false, NOW())`,
-            [uuidv4(), validUserId, scope, title, message]
-        );
-        
-        const recipientMsg = validUserId ? 'Notification sent to selected user' : 'Notification sent to all users';
-        res.json({ success: true, message: recipientMsg });
-    } catch (error) {
-        console.error('Send notification error:', error);
-        res.status(500).json({ success: false, message: 'Server error' });
-    }
-});
-
-app.get('/api/admin/stats', adminAuth, async (req, res) => {
-    try {
-        const users = await pool.query('SELECT COUNT(*) FROM users');
-        const totalDeposits = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'deposit' AND status = 'completed'");
-        const totalAirtime = await pool.query("SELECT COALESCE(SUM(amount), 0) as total FROM transactions WHERE type = 'airtime' AND status = 'completed'");
-        const pendingVerifications = await pool.query("SELECT COUNT(*) FROM deposit_verifications WHERE status = 'pending'");
         
         res.json({
             success: true,
-            stats: {
-                totalUsers: parseInt(users.rows[0].count),
-                totalDeposits: parseFloat(totalDeposits.rows[0].total),
-                totalAirtime: parseFloat(totalAirtime.rows[0].total),
-                pendingVerifications: parseInt(pendingVerifications.rows[0].count)
-            }
+            savings_balance: parseFloat(result.rows[0].savings_balance) || 0
         });
     } catch (error) {
-        console.error('Get stats error:', error);
+        console.error('Get savings balance error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
 
-app.post('/api/admin/logout', (req, res) => {
-    req.session.destroy();
-    res.json({ success: true, message: 'Logged out' });
+// Add to savings balance (for loan deposits)
+app.post('/api/users/savings/deposit', async (req, res) => {
+    try {
+        const { email, amount } = req.body;
+        
+        if (!email || !amount || parseFloat(amount) <= 0) {
+            return res.status(400).json({ success: false, message: 'Email and valid amount required' });
+        }
+        
+        const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        
+        await pool.query(
+            'UPDATE users SET savings_balance = COALESCE(savings_balance, 0) + $1 WHERE id = $2',
+            [parseFloat(amount), userResult.rows[0].id]
+        );
+        
+        res.json({ success: true, message: 'Savings deposited successfully' });
+    } catch (error) {
+        console.error('Savings deposit error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
-app.post('/api/airtime-to-cash/initiate', async (req, res) => {
-    res.status(503).json({ 
-        success: false, 
-        message: 'Airtime to Cash feature coming soon!',
-        comingSoon: true
-    });
+// Get full user balance including savings
+app.get('/api/users/full-balance/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const result = await pool.query(
+            'SELECT balance, bonus_balance, COALESCE(savings_balance, 0) as savings_balance FROM users WHERE LOWER(email) = LOWER($1)',
+            [email]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        
+        res.json({
+            success: true,
+            balance: parseFloat(result.rows[0].balance),
+            bonus: parseFloat(result.rows[0].bonus_balance),
+            savings: parseFloat(result.rows[0].savings_balance) || 0,
+            total: parseFloat(result.rows[0].balance) + parseFloat(result.rows[0].bonus_balance)
+        });
+    } catch (error) {
+        console.error('Get full balance error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
 });
 
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
-
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
+// ============ END SAVINGS BALANCE ENDPOINTS ============
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://airtimesolution-auto.onrender.com'}`);
-    console.log(`Callback URL: ${CALLBACK_BASE_URL}`);
-});
-
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully');
-    pool.end(() => {
-        console.log('Database pool closed');
-        process.exit(0);
-    });
 });
