@@ -1554,6 +1554,225 @@ app.post('/api/airtime-to-cash/initiate', async (req, res) => {
     });
 });
 
+// ===== LOAN SAVINGS ENDPOINTS =====
+
+// Get user savings balance
+app.get('/api/users/savings-balance/:email', async (req, res) => {
+    try {
+        const { email } = req.params;
+        const result = await pool.query(
+            'SELECT COALESCE(permanent_savings_balance, 0) as savings_balance FROM users WHERE LOWER(email) = LOWER($1)',
+            [email]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        
+        res.json({
+            success: true,
+            savings_balance: parseFloat(result.rows[0].savings_balance)
+        });
+    } catch (error) {
+        console.error('Get savings balance error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
+// Initiate loan savings deposit via Paynecta STK push
+app.post('/api/loan/savings-deposit', async (req, res) => {
+    try {
+        const { phone, amount, email } = req.body;
+        
+        console.log('=== LOAN SAVINGS DEPOSIT REQUEST ===');
+        console.log('Request body:', { phone, amount, email });
+        
+        if (!phone || !amount || !email) {
+            return res.status(400).json({ success: false, message: 'Phone, amount, and email are required' });
+        }
+        
+        if (parseFloat(amount) < 100) {
+            return res.status(400).json({ success: false, message: 'Minimum savings deposit is KES 100' });
+        }
+        
+        const userResult = await pool.query('SELECT id FROM users WHERE LOWER(email) = LOWER($1)', [email]);
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'User not found' });
+        }
+        
+        const userId = userResult.rows[0].id;
+        const formattedPhone = phone.startsWith('254') ? phone : `254${phone.replace(/^0/, '')}`;
+        const reference = `LSAV-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        
+        const transactionId = uuidv4();
+        await pool.query(
+            `INSERT INTO transactions (id, user_id, type, amount, fee, bonus, status, external_provider, phone, reference, metadata, created_at)
+             VALUES ($1, $2, 'loan_savings', $3, 0, 0, 'pending', 'paynecta', $4, $5, $6, NOW())`,
+            [transactionId, userId, amount, formattedPhone, reference, JSON.stringify({ type: 'loan_savings' })]
+        );
+        
+        const paynectaPayload = {
+            code: PAYNECTA_CODE,
+            mobile_number: formattedPhone,
+            amount: Math.round(parseFloat(amount))
+        };
+        
+        console.log('Sending Paynecta STK push for loan savings:', paynectaPayload);
+        
+        const paynectaResponse = await axios.post('https://paynecta.co.ke/api/v1/payment/initialize', paynectaPayload, {
+            headers: {
+                'X-API-Key': PAYNECTA_API_KEY,
+                'X-User-Email': PAYNECTA_EMAIL,
+                'Content-Type': 'application/json'
+            }
+        });
+        
+        console.log('Paynecta response:', paynectaResponse.data);
+        
+        if (paynectaResponse.data && paynectaResponse.data.success) {
+            const paynectaReference = paynectaResponse.data.data?.transaction_reference || null;
+            
+            await pool.query(
+                'UPDATE transactions SET metadata = $1 WHERE id = $2',
+                [JSON.stringify({ paynecta_reference: paynectaReference, type: 'loan_savings' }), transactionId]
+            );
+            
+            res.json({
+                success: true,
+                message: 'STK Push sent. Please enter your M-Pesa PIN to complete savings deposit.',
+                reference: reference,
+                transactionId: transactionId
+            });
+        } else {
+            await pool.query('UPDATE transactions SET status = $1 WHERE id = $2', ['failed', transactionId]);
+            res.status(400).json({ success: false, message: paynectaResponse.data.message || 'Payment initiation failed' });
+        }
+    } catch (error) {
+        console.error('Loan savings deposit error:', error);
+        res.status(500).json({ success: false, message: 'Payment service error. Please try again.' });
+    }
+});
+
+// Poll loan savings status
+app.get('/api/loan/savings-status/:reference', async (req, res) => {
+    try {
+        const { reference } = req.params;
+        const result = await pool.query(
+            'SELECT id, user_id, status, amount, metadata, created_at FROM transactions WHERE reference = $1',
+            [reference]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(404).json({ success: false, message: 'Transaction not found' });
+        }
+        
+        const transaction = result.rows[0];
+        
+        if (transaction.status === 'pending') {
+            let paynectaReference = null;
+            try {
+                const metadata = typeof transaction.metadata === 'string' 
+                    ? JSON.parse(transaction.metadata) 
+                    : transaction.metadata;
+                paynectaReference = metadata?.paynecta_reference;
+            } catch (e) {
+                console.log('Error parsing metadata:', e);
+            }
+            
+            if (paynectaReference && PAYNECTA_API_KEY && PAYNECTA_EMAIL) {
+                try {
+                    console.log('Polling PayNecta status for loan savings:', paynectaReference);
+                    
+                    const statusResponse = await axios.get(
+                        `https://paynecta.co.ke/api/v1/payment/status?transaction_reference=${encodeURIComponent(paynectaReference)}`,
+                        {
+                            headers: {
+                                'X-API-Key': PAYNECTA_API_KEY,
+                                'X-User-Email': PAYNECTA_EMAIL
+                            },
+                            timeout: 10000
+                        }
+                    );
+                    
+                    console.log('PayNecta status response:', JSON.stringify(statusResponse.data));
+                    
+                    if (statusResponse.data && statusResponse.data.success && statusResponse.data.data) {
+                        const paymentData = statusResponse.data.data;
+                        const paynectaStatus = (paymentData.status || '').toLowerCase();
+                        
+                        if (paynectaStatus === 'completed') {
+                            const mpesaReceipt = paymentData.mpesa_receipt_number || paymentData.MpesaReceiptNumber || null;
+                            
+                            await pool.query(
+                                `UPDATE transactions SET status = 'completed', metadata = $1 WHERE id = $2`,
+                                [JSON.stringify({ mpesa_code: mpesaReceipt, paynecta_reference: paynectaReference, type: 'loan_savings' }), transaction.id]
+                            );
+                            
+                            const savingsAmount = parseFloat(transaction.amount);
+                            
+                            // Update permanent_savings_balance instead of regular balance
+                            await pool.query(
+                                'UPDATE users SET permanent_savings_balance = COALESCE(permanent_savings_balance, 0) + $1 WHERE id = $2',
+                                [savingsAmount, transaction.user_id]
+                            );
+                            
+                            await pool.query(
+                                `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
+                                 VALUES ($1, $2, 'user', 'Loan Savings Deposited! 🎯', $3, false, NOW())`,
+                                [uuidv4(), transaction.user_id, `KES ${savingsAmount} has been added to your loan savings. Your loan will be processed shortly.`]
+                            );
+                            
+                            console.log(`Loan savings completed for user ${transaction.user_id}: KES ${savingsAmount}`);
+                            
+                            return res.json({ 
+                                success: true, 
+                                transaction: { 
+                                    status: 'completed', 
+                                    amount: transaction.amount,
+                                    created_at: transaction.created_at,
+                                    mpesa_receipt: mpesaReceipt
+                                } 
+                            });
+                            
+                        } else if (paynectaStatus === 'failed' || paynectaStatus === 'cancelled') {
+                            const failureReason = paymentData.failure_reason || paymentData.result_description || 'Payment was not completed';
+                            
+                            await pool.query(
+                                `UPDATE transactions SET status = 'failed', metadata = $1 WHERE id = $2`,
+                                [JSON.stringify({ failure_reason: failureReason, paynecta_reference: paynectaReference, type: 'loan_savings' }), transaction.id]
+                            );
+                            
+                            return res.json({ 
+                                success: true, 
+                                transaction: { 
+                                    status: 'failed', 
+                                    amount: transaction.amount,
+                                    created_at: transaction.created_at,
+                                    failure_reason: failureReason
+                                } 
+                            });
+                        }
+                    }
+                } catch (pollError) {
+                    console.error('PayNecta status poll error:', pollError.message);
+                }
+            }
+        }
+        
+        res.json({ 
+            success: true, 
+            transaction: { 
+                status: transaction.status, 
+                amount: transaction.amount,
+                created_at: transaction.created_at 
+            } 
+        });
+    } catch (error) {
+        console.error('Loan savings status error:', error);
+        res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+
 app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
