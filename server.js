@@ -1560,12 +1560,17 @@ function adminAuth(req, res, next) {
 app.get('/api/admin/users', adminAuth, async (req, res) => {
     try {
         const result = await pool.query(
-            `SELECT id, email, balance, bonus_balance, is_disabled, created_at, last_login_at 
+            `SELECT id, email, balance, bonus_balance, COALESCE(savings_balance, 0) as savings_balance, is_disabled, created_at, last_login_at 
              FROM users ORDER BY created_at DESC`
         );
         res.json({ success: true, users: result.rows });
     } catch (error) {
         console.error('Admin get users error:', error);
+      res.status(500).json({ success: false, message: 'Server error' });
+    }
+});
+app.get('/api/admin/savings', adminAuth, async (req, res) => {
+    try {
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
