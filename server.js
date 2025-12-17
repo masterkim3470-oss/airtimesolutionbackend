@@ -1833,7 +1833,7 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://airtimesolution-auto.onrender.com'}`);
+    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://pesahublmtd.onrender.com'}`);
     console.log(`Callback URL: ${CALLBACK_BASE_URL}`);
 });
 
