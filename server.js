@@ -1571,6 +1571,13 @@ app.get('/api/admin/users', adminAuth, async (req, res) => {
 });
 app.get('/api/admin/savings', adminAuth, async (req, res) => {
     try {
+        const result = await pool.query(
+            `SELECT u.id, u.email, COALESCE(u.savings_balance, 0) as savings_balance 
+             FROM users u WHERE u.savings_balance > 0 ORDER BY u.savings_balance DESC`
+        );
+        res.json({ success: true, savings: result.rows });
+    } catch (error) {
+        console.error('Admin get savings error:', error);
         res.status(500).json({ success: false, message: 'Server error' });
     }
 });
