@@ -1816,10 +1816,14 @@ app.get('/api/health', (req, res) => {
     res.json({ status: 'OK', timestamp: new Date().toISOString() });
 });
 
-app.use(express.static(__dirname));
-
+// Root route - API info (no static files since frontend is separate)
 app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'index.html'));
+    res.json({ 
+        success: true, 
+        message: 'Airtime Solution Kenya API is running',
+        status: 'online',
+        version: '1.0.0'
+    });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
