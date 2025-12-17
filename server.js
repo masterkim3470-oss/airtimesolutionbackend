@@ -82,7 +82,7 @@ const adminLoginLimiter = rateLimit({
 app.get('/api/status', (req, res) => {
     res.json({ 
         success: true, 
-        message: 'Airtime Solution Kenya API is running',
+        message: 'Pesahub Kenya API is running',
         status: 'online'
     });
 });
@@ -147,7 +147,7 @@ app.post('/api/users/register', async (req, res) => {
         
         await pool.query(
             `INSERT INTO notifications (id, user_id, scope, title, message, is_read, created_at)
-             VALUES ($1, $2, 'user', 'Welcome to Airtime Solution Kenya! 🎉', 'Thank you for joining us. Start by depositing funds to buy and sell airtime and earn extra commission. other services includes; Bulk sms(coming soon),Airtime to cash(coming soon),surveys(coming soon) and lastly Bingwa bundles(coming soon).', false, NOW())`,
+             VALUES ($1, $2, 'user', 'Welcome to Pesahub Kenya! 🎉', 'Thank you for joining us. Start by depositing funds to buy and sell airtime and earn extra commission. other services includes; Bulk sms(coming soon),Airtime to cash(coming soon),surveys(coming soon) and lastly Bingwa bundles(coming soon).', false, NOW())`,
             [uuidv4(), id]
         );
         
@@ -1480,7 +1480,7 @@ app.get('/api/transactions/:email/pdf', async (req, res) => {
         
         doc.pipe(res);
         
-        doc.fontSize(20).text('Airtime Solution Kenya', { align: 'center' });
+        doc.fontSize(20).text('Pesahub Kenya', { align: 'center' });
         doc.fontSize(12).text('Transaction History', { align: 'center' });
         doc.moveDown();
         doc.fontSize(10).text(`Email: ${email}`);
@@ -1820,7 +1820,7 @@ app.get('/api/health', (req, res) => {
 app.get('/', (req, res) => {
     res.json({ 
         success: true, 
-        message: 'Airtime Solution Kenya API is running',
+        message: 'Pesahub Kenya API is running',
         status: 'online',
         version: '1.0.0'
     });
