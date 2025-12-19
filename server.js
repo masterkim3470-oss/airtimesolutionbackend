@@ -88,7 +88,7 @@ app.get('/api/status', (req, res) => {
 });
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
-const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_498195';
+const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_609202';
 const STATUM_CONSUMER_KEY = process.env.STATUM_CONSUMER_KEY;
 const STATUM_CONSUMER_SECRET = process.env.STATUM_CONSUMER_SECRET;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '3462Abel@#';
