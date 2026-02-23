@@ -1542,7 +1542,7 @@ console.log("ENV:", process.env.ADMIN_PASSWORD);
         return res.status(400).json({ success: false, message: 'Password required' });
     }
     
-    if (password === ADMIN_PASSWORD) {
+    if (password === process.env.ADMIN_PASSWORD) {
         req.session.isAdmin = true;
         console.log(`Admin login from IP: ${req.ip}`);
         res.json({ success: true, message: 'Admin logged in' });
