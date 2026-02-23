@@ -1535,14 +1535,12 @@ app.put('/api/notifications/:id/read', async (req, res) => {
 
 app.post('/api/admin/login', adminLoginLimiter, (req, res) => {
     const { password } = req.body;
- console.log("Entered:", password);
-console.log("ENV:", process.env.ADMIN_PASSWORD);
     
     if (!password) {
         return res.status(400).json({ success: false, message: 'Password required' });
     }
     
-    if (password === process.env.ADMIN_PASSWORD) {
+    if (password === ADMIN_PASSWORD) {
         req.session.isAdmin = true;
         console.log(`Admin login from IP: ${req.ip}`);
         res.json({ success: true, message: 'Admin logged in' });
