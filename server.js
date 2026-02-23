@@ -88,10 +88,10 @@ app.get('/api/status', (req, res) => {
 });
 const PAYNECTA_API_KEY = process.env.PAYNECTA_API_KEY;
 const PAYNECTA_EMAIL = process.env.PAYNECTA_EMAIL;
-const PAYNECTA_CODE = process.env.PAYNECTA_CODE;
+const PAYNECTA_CODE = process.env.PAYNECTA_CODE || 'PNT_609202';
 const STATUM_CONSUMER_KEY = process.env.STATUM_CONSUMER_KEY;
 const STATUM_CONSUMER_SECRET = process.env.STATUM_CONSUMER_SECRET;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '3462Abel@#';
 const CALLBACK_BASE_URL = process.env.CALLBACK_BASE_URL || 'https://airtimesolutionbackend2.onrender.com';
 const PAYHERO_LINK = 'https://short.payhero.co.ke/s/oEvAxA8Xx6cDoBLxntShmF';
 
@@ -1840,7 +1840,7 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
-    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://cheapairtimeke.onrender.com'}`);
+    console.log(`Frontend origin: ${process.env.FRONTEND_ORIGIN || 'https://pesahublmtd.onrender.com'}`);
     console.log(`Callback URL: ${CALLBACK_BASE_URL}`);
 });
 
